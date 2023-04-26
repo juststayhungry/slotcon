@@ -8,14 +8,14 @@ import torchvision
 保持对其的跟紧，作为一个方法、思想
 '''
 class DINOHead(nn.Module):
-    '''
-    linear+bn+gelu*3 +Linear(bottleneck)  non-linear predictor
+    ''' b  k*d  256--4096---256
+    （linear+bn+gelu）*3 +Linear(bottleneck)  non-linear predictor。将stu的输出进一步变换。predictor 避免训练崩塌的重要元素之一
     '''
     def __init__(self, in_dim, use_bn=True, nlayers=3, hidden_dim=4096, bottleneck_dim=256):
         super().__init__()
         nlayers = max(nlayers, 1)
         if nlayers == 1:
-            self.mlp = nn.Linear(in_dim, bottleneck_dim)
+            self.mlp = nn.Linear(in_dim, bottleneck_dim)#根据输入参数来判断此时是实例化还是调用该函数的call调用的forward
         else:
             layers = [nn.Linear(in_dim, hidden_dim)]
             if use_bn:
@@ -44,8 +44,9 @@ class DINOHead2d(nn.Module):
     '''
     输入：encoder输出的feature
     投射projector
-    输出：feature map
+    输出：feature map，输出通道数c：256。b c h w
     conv2d+bn+2*(conv+gelu)+conv2d(bottleneck)
+    卷积核的大小均为1*1projector降维
     '''
     def __init__(self, in_dim, use_bn=True, nlayers=3, hidden_dim=4096, bottleneck_dim=256):
         super().__init__()
@@ -75,92 +76,11 @@ class DINOHead2d(nn.Module):
     def forward(self, x):
         x = self.mlp(x)
         return x
-# class SlotAttention(layers.Layer):
-#   """Slot Attention module.带着GRU的transformer
-#   用一个slot去找到一个对象，object-level"""
-
-#   def __init__(self, num_iterations, num_slots, slot_size, mlp_hidden_size,
-#                epsilon=1e-8):
-#     """Builds the Slot Attention module.
-#     Args:
-#       num_iterations: Number of iterations.
-#       num_slots: Number of slots.
-#       slot_size: Dimensionality of slot feature vectors.
-#       mlp_hidden_size: Hidden layer size of MLP.
-#       epsilon: Offset for attention coefficients before normalization.
-#     """
-#     super().__init__()
-#     self.num_iterations = num_iterations#迭代次数
-#     self.num_slots = num_slots
-#     self.slot_size = slot_size
-#     self.mlp_hidden_size = mlp_hidden_size
-#     self.epsilon = epsilon
-
-#     self.norm_inputs = layers.LayerNormalization()
-#     self.norm_slots = layers.LayerNormalization()
-#     self.norm_mlp = layers.LayerNormalization()
-
-#     # Parameters for Gaussian init (shared by all slots).
-#     self.slots_mu = self.add_weight(
-#         initializer="glorot_uniform",
-#         shape=[1, 1, self.slot_size],
-#         dtype=tf.float32,
-#         name="slots_mu")
-#     self.slots_log_sigma = self.add_weight(
-#         initializer="glorot_uniform",
-#         shape=[1, 1, self.slot_size],
-#         dtype=tf.float32,
-#         name="slots_log_sigma")
-
-#     # Linear maps for the attention module.
-#     self.project_q = layers.Dense(self.slot_size, use_bias=False, name="q")
-#     self.project_k = layers.Dense(self.slot_size, use_bias=False, name="k")
-#     self.project_v = layers.Dense(self.slot_size, use_bias=False, name="v")
-
-#     # Slot update functions.
-#     self.gru = layers.GRUCell(self.slot_size)
-#     self.mlp = tf.keras.Sequential([
-#         layers.Dense(self.mlp_hidden_size, activation="relu"),
-#         layers.Dense(self.slot_size)
-#     ], name="mlp")
-
-#   def call(self, inputs):
-#     # `inputs` has shape [batch_size, num_inputs, inputs_size].
-#     inputs = self.norm_inputs(inputs)  # Apply layer norm to the input.
-#     k = self.project_k(inputs)  # Shape: [batch_size, num_inputs, slot_size].
-#     v = self.project_v(inputs)  # Shape: [batch_size, num_inputs, slot_size].
-
-#     # Initialize the slots. Shape: [batch_size, num_slots, slot_size].
-#     slots = self.slots_mu + tf.exp(self.slots_log_sigma) * tf.random.normal(
-#         [tf.shape(inputs)[0], self.num_slots, self.slot_size])
-
-#     # Multiple rounds of attention.
-#     for _ in range(self.num_iterations):
-#       slots_prev = slots
-#       slots = self.norm_slots(slots)
-
-#       # Attention.
-#       q = self.project_q(slots)  # Shape: [batch_size, num_slots, slot_size].
-#       q *= self.slot_size ** -0.5  # Normalization.
-#       attn_logits = tf.keras.backend.batch_dot(k, q, axes=-1)
-#       attn = tf.nn.softmax(attn_logits, axis=-1)
-#       # `attn` has shape: [batch_size, num_inputs, num_slots].
-
-#       # Weigted mean.# aggregate
-#       attn += self.epsilon
-#       attn /= tf.reduce_sum(attn, axis=-2, keepdims=True)
-#       updates = tf.keras.backend.batch_dot(attn, v, axes=-2)
-#       # `updates` has shape: [batch_size, num_slots, slot_size].
-
-#       # Slot update.
-#       slots, _ = self.gru(updates, [slots_prev])
-#       slots += self.mlp(self.norm_mlp(slots))
-
-#     return slots
-
+    
 class SemanticGrouping(nn.Module):
     '''
-    输入：
+    实例化的输入：聚类数量，维度
+    实例对象的输入：projector的输出feature
     输出：dots  slots
     功能：语义聚类
     唯一可学习参数：聚类中心slot，nn.embedding
@@ -182,21 +102,21 @@ class SemanticGrouping(nn.Module):
         '''
     def forward(self, x):
         x_prev = x
-        slots = self.slot_embed(torch.arange(0, self.num_slots, device=x.device)).unsqueeze(0).repeat(x.size(0), 1, 1)
+        slots = self.slot_embed(torch.arange(0, self.num_slots, device=x.device)).unsqueeze(0).repeat(x.size(0), 1, 1)#b个slots，每个slots是一个词汇表(num*dim) b k dim
         dots = torch.einsum('bkd,bdhw->bkhw', F.normalize(slots, dim=2), F.normalize(x, dim=1))#normalize归一化后的zθl 输入的feature map:x与聚类中心slot做点乘操作
-        '''
+        '''b c h w,  bkd11,b1dhw---将输入的feature与slot做注意力操作
         矩阵运算是核心
          PyTorch 的函数 einsum，它实现了张量的乘法和求和操作。
-        具体来说，该函数的第一个参数是一个字符串，指定了输入张量之间的运算规则。其中，'bkd' 表示第一个输入张量slots的形状为 (b,k,d)batch/k聚类中心数/d特征维度，'bdhw' 表示第二个输入张量的形状为 (b, d, h, w)，'nkhw' 表示输出张量的形状为 (b, k, h, w)。
+        具体来说，该函数的第一个参数是一个字符串，指定了输入张量之间的运算规则。其中，'bkd' 表示第一个输入张量slots的形状为 (b,k,d)batch/k聚类中心数/d特征维度，'bdhw' 表示第二个输入张量的形状为 (b, d, h, w)
         这意味着函数将两个张量进行了乘法运算，并沿着 k 维度和 d*h*w 维度进行求和，得到了一个形状为 (b, k, h, w) 的输出张量：。
         '''
         '''
-        得到聚类中心响应dots:map-----dots后，利用attention pooling操作得到slots
+        得到聚类中心响应dots:map-----dots bkhw    
         '''
-        attn = (dots / self.temp).softmax(dim=1) + self.eps#Aθl(attn)=softmax(  dots / self.temp )/温度系数并在dim=1下归一化sum=1
+        attn = (dots / self.temp).softmax(dim=1) + self.eps#Aθl(attn)=softmax(  dots / self.temp )/温度系数并在dim=1下归一化sum=1#softmax分布结果(dino的部分)
         slots = torch.einsum('bdhw,bkhw->bkd', x_prev, attn / attn.sum(dim=(2, 3), keepdim=True))#Sθ(slot)=平均化(x点乘attn)
         '''
-        通过slot attention得到slots
+        通过slot attention得到slots  bkd
         '''
         return slots, dots
 
@@ -256,12 +176,7 @@ class SlotCon(nn.Module):
         该缓存变量是一个形状为 (1, self.num_prototypes) 的张量(tensor)，元素全部初始化为 0。
         其中，self 是指该代码所在的类的实例对象。
         '''
-
-        self.grouping_q = SemanticGrouping(self.num_prototypes, self.dim_out, self.teacher_temp)
-        
-        '''
-
-        '''
+        self.grouping_q = SemanticGrouping(self.num_prototypes, self.dim_out, self.teacher_temp)#实例化
         self.grouping_k = SemanticGrouping(self.num_prototypes, self.dim_out, self.teacher_temp)
         self.predictor_slot = DINOHead(self.dim_out, hidden_dim=self.dim_hidden, bottleneck_dim=self.dim_out)
         '''
@@ -295,6 +210,8 @@ class SlotCon(nn.Module):
         self.k += 1
         for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
             param_k.data = param_k.data * momentum + param_q.data * (1. - momentum)
+                    # ema update   原来的数值*m+更新(shudent的数值)*(1-m)
+        # self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)#将teacher的输出求和，求平均，ema形式的更新center
         for param_q, param_k in zip(self.projector_q.parameters(), self.projector_k.parameters()):
             param_k.data = param_k.data * momentum + param_q.data * (1. - momentum)
         for param_q, param_k in zip(self.grouping_q.parameters(), self.grouping_k.parameters()):
@@ -317,15 +234,15 @@ class SlotCon(nn.Module):
         x_flipped = torch.stack([feat.flip(-1) if flag else feat for feat, flag in zip(x_aligned, flags)])
         return x_flipped
 
-    def self_distill(self, q, k): #DINO伪代码里面的def H(t,s)
+    def self_distill(self, q, k): #DINO伪代码里面的def H(t,s)，输入两个view的分布，输出对应的自蒸馏损失函数(即两view量化的差异)
         '''
-        自蒸馏
+        输入对齐后的dots以后再做softmax归一化，计算交叉熵损失CE_loss=-q*logp
+        自蒸馏q1_aligned.permute(0, 2, 3, 1).flatten(0, 2)  ------  k2_aligned.permute(0, 2, 3, 1).flatten(0, 2)
+        q1_aligned, q2_aligned = self.invaug(score_q1, coords[0], flags[0]), self.invaug(score_q2, coords[1], flags[1])
+        #对聚类中心响应后的map做inverse augument对齐align
         '''
         q = F.log_softmax(q / self.student_temp, dim=-1)
-        '''
-        在 PyTorch 中，dim 参数通常用于指定对张量进行操作的维度。
-        在这个例子中，dim=-1 是指在最后一个维度上进行操作，也就是对最后一个维度上的元素进行操作
-        '''
+
         k = F.softmax((k - self.center) / self.teacher_temp, dim=-1)
         '''
         center平滑
@@ -337,29 +254,39 @@ class SlotCon(nn.Module):
         '''
         q2, k1, score_q2, score_k1
         q,k是slots，score是dots
-        对比学习的损失函数:InfoNCE，k需要normalize归一化？
+        对比学习的损失函数:InfoNCE
         '''
-        q = q.flatten(0, 1)
-        k = F.normalize(k.flatten(0, 1), dim=1)
+        q = q.flatten(0, 1)  #q:bkd---b*k  d   q先predictor后再做归一化
+        k = F.normalize(k.flatten(0, 1), dim=1)#k先展平至b*k  d后归一化
         '''
-        mask掉冗余的slots(因为初始化的slots是由整个数据集共享)
+        由于初始的slot由整个数据集共享，因此在一个特定的视图view中可能缺少相应的语义，从而产生冗余的slot。
+        因此计算以下二进制指示器1l(sumsum>0)来掩盖mask无法占据主导像素的插槽
+        '''
+        '''#scatter_(dim,index,src)，在维度dim上，将索引号为index最大分数的位置，替换为src:1    
+        dots:bkhw
+        scatter_(1, score_q.argmax(1, keepdim=True), 1)得到n个样本的k张h*w大小的slot_i（语义类别i）(i=0~k-1)的响应图
+        sum sum>0   mask无法占据主导像素的插槽(k类的响应小于0的mask掉)  ---b k，且全部都>0/=0(mask)   ---mask_q:b k    a1...ak  b1...bk
         '''
         mask_q = (torch.zeros_like(score_q).scatter_(1, score_q.argmax(1, keepdim=True), 1).sum(-1).sum(-1) > 0).long().detach()
         mask_k = (torch.zeros_like(score_k).scatter_(1, score_k.argmax(1, keepdim=True), 1).sum(-1).sum(-1) > 0).long().detach()#K个概率取最大概率---对应一类，生成与类别绑定的masks。
-        mask_intersection = (mask_q * mask_k).view(-1)#单步调试 GDB FPGD
-        idxs_q = mask_intersection.nonzero().squeeze(-1)
+        mask_intersection = (mask_q * mask_k).view(-1)#展平，b k---b*k               a1...akb1...bk
+        #单步调试 GDB FPGD
+        idxs_q = mask_intersection.nonzero().squeeze(-1)#含语义的slot索引---单一维度的idxs_q
 
-        mask_k = concat_all_gather(mask_k.view(-1))
-        idxs_k = mask_k.nonzero().squeeze(-1)
+        mask_k = concat_all_gather(mask_k.view(-1))#展平，b k---b*k               a1...akb1...bk
+        idxs_k = mask_k.nonzero().squeeze(-1)#除去没有物体的，得到含有物体的idxs
 
-        N = k.shape[0]
+        N = k.shape[0] #k: b*k*d           #q[idxs_q]：b*k  d_in ---predictor---b*k  d_out   (d_in=d_out=agr.dim-out = 256)
+        # b*k  d_out,b*k_gather  d_out-> b*k  b*k_gather(两view的交互响应矩阵)
         logits = torch.einsum('nc,mc->nm', [F.normalize(self.predictor_slot(q[idxs_q]), dim=1), concat_all_gather(k)[idxs_k]]) / tau
-        labels = mask_k.cumsum(0)[idxs_q + N * torch.distributed.get_rank()] - 1
+        labels = mask_k.cumsum(0)[idxs_q + N * torch.distributed.get_rank()] - 1#标签的取值范围应该在[0，类别数-1]之间
         '''
+        nn.CrossEntropyLoss()函数不需要对logits进行softmax操作，因为它包含了softmax计算的过程。
+        同时，labels的形状应该与logits的形状相同，即每个样本对应一个标签，标签的取值范围应该在[0，类别数-1]之间。
         使用交叉熵损失函数计算InfoNCE损失。其中，labels表示Key的分类标签，也就是按照相似度排序后每个Key所在的类别编号。
         具体来说，通过mask_k.cumsum(0)计算得到Key的类别累计和，再根据idxs_q和进程编号获得对应的类别编号，从而得到labels
         '''
-        return F.cross_entropy(logits, labels) * (2 * tau)
+        return F.cross_entropy(logits, labels) * (2 * tau)#labels怎么得到的，因为是自监督，将k的输出作为label
 
     def forward(self, input):
         crops, coords, flags = input
@@ -373,31 +300,31 @@ class SlotCon(nn.Module):
         with torch.no_grad():
             (k1, score_k1), (k2, score_k2) = self.grouping_k(y1), self.grouping_k(y2)#对投影输出的key做语义分组得到slots-----k or q 与dots------score(响应后的map)
             k1_aligned, k2_aligned = self.invaug(score_k1, coords[0], flags[0]), self.invaug(score_k2, coords[1], flags[1])#对聚类中心响应后的map做inverse augument对齐align
-        
+
         loss = self.group_loss_weight * self.self_distill(q1_aligned.permute(0, 2, 3, 1).flatten(0, 2), k2_aligned.permute(0, 2, 3, 1).flatten(0, 2)) \
              + self.group_loss_weight * self.self_distill(q2_aligned.permute(0, 2, 3, 1).flatten(0, 2), k1_aligned.permute(0, 2, 3, 1).flatten(0, 2))#\换行
 
-        self.update_center(torch.cat([score_k1, score_k2]).permute(0, 2, 3, 1).flatten(0, 2))
+        self.update_center(torch.cat([score_k1, score_k2]).permute(0, 2, 3, 1).flatten(0, 2))#bkhw  bhwk---flatten(s=0,end=2)保留b与h维度  b*h*w  k
         '''
         loss=group_loss_weight*自蒸馏的损失(两个dots对齐后的损失)+(1-group_loss_weight)*slots：q1,q2对比学习的infoNCE损失
         '''
         loss += (1. - self.group_loss_weight) * self.ctr_loss_filtered(q1, k2, score_q1, score_k2) \
               + (1. - self.group_loss_weight) * self.ctr_loss_filtered(q2, k1, score_q2, score_k1)
-        '''model(x)返回的就是forward的输出，即loss'''
+        '''model(input data)返回的就是forward的输出，即loss或者y'''
         return loss
     
     @torch.no_grad()
     def update_center(self, teacher_output):
         """
         Update center used for teacher output.
-        对teacher输出的score_k（map？）做center操作，中心化操作，需要将
+        对teacher输出b*h*w  k做center操作，中心化操作，需要将
         """
         batch_center = torch.sum(teacher_output, dim=0, keepdim=True)
         dist.all_reduce(batch_center)
         batch_center = batch_center / (len(teacher_output) * dist.get_world_size())
 
         # ema update
-        self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
+        self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)#将teacher的输出求和，求平均，ema形式的更新center
 
 @torch.no_grad()
 def concat_all_gather(tensor):
@@ -436,7 +363,7 @@ class SlotConEval(nn.Module):
     def forward(self, x):
         with torch.no_grad():
             slots, probs = self.grouping_k(self.projector_k(self.encoder_k(x)))#整体流程
-            return probs
+            return probs #dots
         
 #SwAV的训练
 '''
@@ -577,4 +504,91 @@ class DINOLoss(nn.Module):
         total_loss /= n_loss_terms
         self.update_center(teacher_output)
         return total_loss
+'''
+
+
+'''SlotAttention'''
+'''
+# class SlotAttention(layers.Layer):
+#   """Slot Attention module.带GRU的transformer
+#   用一个slot去找到一个对象，object-level"""
+
+#   def __init__(self, num_iterations, num_slots, slot_size, mlp_hidden_size,
+#                epsilon=1e-8):
+#     """Builds the Slot Attention module.
+#     Args:
+#       num_iterations: Number of iterations.
+#       num_slots: Number of slots.
+#       slot_size: Dimensionality of slot feature vectors.
+#       mlp_hidden_size: Hidden layer size of MLP.
+#       epsilon: Offset for attention coefficients before normalization.
+#     """
+#     super().__init__()
+#     self.num_iterations = num_iterations#迭代次数
+#     self.num_slots = num_slots
+#     self.slot_size = slot_size
+#     self.mlp_hidden_size = mlp_hidden_size
+#     self.epsilon = epsilon
+
+#     self.norm_inputs = layers.LayerNormalization()
+#     self.norm_slots = layers.LayerNormalization()
+#     self.norm_mlp = layers.LayerNormalization()
+
+#     # Parameters for Gaussian init (shared by all slots).
+#     self.slots_mu = self.add_weight(
+#         initializer="glorot_uniform",
+#         shape=[1, 1, self.slot_size],
+#         dtype=tf.float32,
+#         name="slots_mu")
+#     self.slots_log_sigma = self.add_weight(
+#         initializer="glorot_uniform",
+#         shape=[1, 1, self.slot_size],
+#         dtype=tf.float32,
+#         name="slots_log_sigma")
+
+#     # Linear maps for the attention module.
+#     self.project_q = layers.Dense(self.slot_size, use_bias=False, name="q")
+#     self.project_k = layers.Dense(self.slot_size, use_bias=False, name="k")
+#     self.project_v = layers.Dense(self.slot_size, use_bias=False, name="v")
+
+#     # Slot update functions.
+#     self.gru = layers.GRUCell(self.slot_size)#用于迭代更新slot
+#     self.mlp = tf.keras.Sequential([
+#         layers.Dense(self.mlp_hidden_size, activation="relu"),
+#         layers.Dense(self.slot_size)
+#     ], name="mlp")
+
+#   def call(self, inputs):
+#     # `inputs` has shape [batch_size, num_inputs, inputs_size].
+#     inputs = self.norm_inputs(inputs)  # Apply layer norm to the input.
+#     k = self.project_k(inputs)  # Shape: [batch_size, num_inputs, slot_size].
+#     v = self.project_v(inputs)  # Shape: [batch_size, num_inputs, slot_size].
+
+#     # Initialize the slots. Shape: [batch_size, num_slots, slot_size].
+#     slots = self.slots_mu + tf.exp(self.slots_log_sigma) * tf.random.normal(
+#         [tf.shape(inputs)[0], self.num_slots, self.slot_size])
+
+#     # Multiple rounds of attention.
+#     for _ in range(self.num_iterations):
+#       slots_prev = slots
+#       slots = self.norm_slots(slots)
+
+#       # Attention.
+#       q = self.project_q(slots)  # Shape: [batch_size, num_slots, slot_size].
+#       q *= self.slot_size ** -0.5  # Normalization.
+#       attn_logits = tf.keras.backend.batch_dot(k, q, axes=-1)
+#       attn = tf.nn.softmax(attn_logits, axis=-1)
+#       # `attn` has shape: [batch_size, num_inputs, num_slots].
+
+#       # Weigted mean.# aggregate
+#       attn += self.epsilon
+#       attn /= tf.reduce_sum(attn, axis=-2, keepdims=True)
+#       updates = tf.keras.backend.batch_dot(attn, v, axes=-2)
+#       # `updates` has shape: [batch_size, num_slots, slot_size].
+
+#       # Slot update.
+#       slots, _ = self.gru(updates, [slots_prev])#迭代更新slot
+#       slots += self.mlp(self.norm_mlp(slots))
+
+#     return slots
 '''

@@ -32,24 +32,20 @@ def get_features(model, dataset, bs):
 
     bank = []
     for data in tqdm(memory_loader, desc='Feature extracting', leave=False, disable=False):
-        feature = model.projector_k(model.encoder_k(data))#.mean(dim=(-2, -1))
-        feature = F.normalize(feature, dim=1)
+        feature = model.projector_k(model.encoder_k(data))#.mean(dim=(-2, -1)) #data(bhw)-encoder-->(bchw)---projector(降维)--bdhw
+        feature = F.normalize(feature, dim=1)#bdhw
         bank.append(feature)
-    bank = torch.cat(bank, dim=0)
+    bank = torch.cat(bank, dim=0)# n(n=b*i) dhw
     return bank
 
 def prepare_knn(model, dataset, args):
-    prototypes = F.normalize(model.grouping_k.slot_embed.weight, dim=1) # k x d
-    memory_bank = get_features(model, dataset, args.batch_size) # n x d x h x w
-    dots = torch.einsum('kd,ndhw->nkhw', [prototypes, memory_bank]) # n x k x h x w
-    masks = torch.zeros_like(dots).scatter_(1, dots.argmax(1, keepdim=True), 1)#K个概率取最大概率---对应一类，生成与类别绑定的masks。
-    '''
-    由于初始的插槽由整个数据集共享，因此在一个特定的视图vl中可能缺少相应的语义，从而产生冗余的插槽。
-    因此计算以下二进制指示器1l来掩盖无法占据主导像素的插槽：
-    '''
+    prototypes = F.normalize(model.grouping_k.slot_embed.weight, dim=1) # kd
+    memory_bank = get_features(model, dataset, args.batch_size) # ndhw
+    dots = torch.einsum('kd,ndhw->nkhw', [prototypes, memory_bank]) # nkhw
+    masks = torch.zeros_like(dots).scatter_(1, dots.argmax(1, keepdim=True), 1)#nkhw n个样本的k张h*w大小的slot_i(i=0~k-1)的响应图
     masks_adder = masks + 1.e-6
-    scores = (dots * masks_adder).sum(-1).sum(-1) / masks_adder.sum(-1).sum(-1) # n x k  求出与mask响应最强的前K个dots
-    _, idxs = scores.t().topk(dim=1, k=args.topk)
+    scores = (dots * masks_adder).sum(-1).sum(-1) / masks_adder.sum(-1).sum(-1) # nk   n k 求出每个slot的响应数值
+    _, idxs = scores.t().topk(dim=1, k=args.topk)#选择batch中每类slot中响应最强的K个样本的索引输出
     return dots, idxs
 
 def viz_slots(dataset, dots, idxs, slot_idxs, args):   

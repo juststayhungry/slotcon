@@ -93,7 +93,7 @@ def build_model(args):
         raise NotImplementedError
     
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank])
-    # loss = model((crops, coords, flags))????三参数是来源的input本身就是，然后那个batch也是拆分成三参数了。
+
     return model, optimizer
 
 def save_checkpoint(args, epoch, model, optimizer, scheduler, scaler=None):
@@ -144,14 +144,13 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs + 1) save_checkpoint
     在train内部:
             model.train()
-
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
+            loss.backward()#BP
+            optimizer.step()#SGD
     '''
     transform = CustomDataAugmentation(args.image_size, args.min_scale)
     train_dataset = ImageFolder(args.dataset, args.data_dir, transform)
+    #crops_transformed, coords, flags#   crop后的图像；坐标（便于后续逆增强）；翻转标志
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), 
@@ -195,7 +194,7 @@ def main(args):
 
 def train(train_loader, model, optimizer, scaler, scheduler, epoch, args):
     batch_time = AverageMeter()
-    '''使用 AverageMeter() 这个工具类来计算一个指标（Metric）的平均值和当前值。它通常用于训练过程中统计损失函数或准确率等变量的平均值。log
+    '''使用 AverageMeter() 这个工具类来计算一个指标（Metric）的平均值和当前值。它通常用于训练过程中统计损失函数或准确率等变量的平均值。打log
     '''
     loss_meter = AverageMeter()
     # switch to train mode
@@ -203,8 +202,8 @@ def train(train_loader, model, optimizer, scaler, scheduler, epoch, args):
     end = time.time()
     train_len = len(train_loader)
     for i, batch in enumerate(train_loader):
-        '''crops是一组图像裁剪片段，coords是这些片段相对于原始图像的坐标信息，flags是这些片段是否包含目标对象的标志'''
-        crops, coords, flags = batch#GPU，弄清楚三个是啥
+        '''crops_transformed, coords, flags#crop后的图像；相对于原始图像的坐标信息的“归一化”坐标（便于后续逆增强对齐两个dots）；flags是翻转标志'''
+        crops, coords, flags = batch
         '''
         使用列表解析式将每个crop、coord和flag转换为CUDA张量，即将它们放入GPU设备的内存中进行计算，加快计算速度。
         其中non_blocking=True参数可以加速GPU张量的传输，不会阻塞CPU的运行。
@@ -216,7 +215,18 @@ def train(train_loader, model, optimizer, scaler, scheduler, epoch, args):
 
         # compute output and loss
         with torch.cuda.amp.autocast(scaler is not None):
-            loss = model((crops, coords, flags))
+            '''
+            混合精度 (Automatically Mixed Precision, AMP) 训练已经成为了炼丹师的标配工具，仅仅只需几行代码，就能让显存占用减半，训练速度加倍。
+            修改如下即可。仅需要加在output 与 loss上即可
+            with torch.cuda.amp.autocast():
+                output = net(input)
+                loss = loss_fn(output, target)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            '''
+            loss = model((crops, coords, flags))#因为call方法中调用了forward，故该语句实际上是执行model.forward()，输入：data，输出:loss
         
         optimizer.zero_grad()
         if args.fp16:
@@ -225,8 +235,8 @@ def train(train_loader, model, optimizer, scaler, scheduler, epoch, args):
             scaler.step(optimizer)
             scaler.update()
         else:
-            loss.backward()
-            optimizer.step()
+            loss.backward()#BP
+            optimizer.step()#SGD
         scheduler.step()
 
         # avg loss from batch size
@@ -254,8 +264,7 @@ if __name__ == '__main__':
 
     args.world_size = dist.get_world_size()
     args.batch_size = int(args.batch_size / args.world_size)
-    ''''''
-    # setup logger
+    '''# setup logger'''
     os.makedirs(args.output_dir, exist_ok=True)
     logger = setup_logger(output=args.output_dir,
                           distributed_rank=dist.get_rank(), name="slotcon")
@@ -272,8 +281,3 @@ if __name__ == '__main__':
     )
 
     main(args)
-'''
-区别在于需要载入初始模型
-且损失函数不同
-cuda环境的迁移，之前按照的不在该虚拟环境，cuda11.8(系统上装的)与最常用的pytorch1.12(一直用这个，因为conda内存C盘)可以适配吗
-'''
