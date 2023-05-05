@@ -4,9 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import torchvision
-'''
-保持对其的跟紧，作为一个方法、思想
-'''
+
 class DINOHead(nn.Module):
     ''' b  k*d  256--4096---256
     （linear+bn+gelu）*3 +Linear(bottleneck)  non-linear predictor。将stu的输出进一步变换。predictor 避免训练崩塌的重要元素之一
@@ -42,7 +40,7 @@ class DINOHead(nn.Module):
 
 class DINOHead2d(nn.Module):
     '''
-    输入：encoder输出的feature
+    输入：encoder输出的feature resnet: bdhw(d = 512/2048)  ViT
     投射projector
     输出：feature map，输出通道数c：256。b c h w
     conv2d+bn+2*(conv+gelu)+conv2d(bottleneck)
@@ -102,16 +100,15 @@ class SemanticGrouping(nn.Module):
         '''
     def forward(self, x):
         x_prev = x
+        torch.matmul()
         slots = self.slot_embed(torch.arange(0, self.num_slots, device=x.device)).unsqueeze(0).repeat(x.size(0), 1, 1)#b个slots，每个slots是一个词汇表(num*dim) b k dim
         dots = torch.einsum('bkd,bdhw->bkhw', F.normalize(slots, dim=2), F.normalize(x, dim=1))#normalize归一化后的zθl 输入的feature map:x与聚类中心slot做点乘操作
-        '''b c h w,  bkd11,b1dhw---将输入的feature与slot做注意力操作
+        '''将输入的feature与slot做注意力操作  kd@dhw---khw
+        dots是k:input，q:slots做注意力得到的初始化未经过归一化前的权重系数矩阵，做softmax后才是attn。将attn@input后得到的就是更新后的slot
         矩阵运算是核心
          PyTorch 的函数 einsum，它实现了张量的乘法和求和操作。
-        具体来说，该函数的第一个参数是一个字符串，指定了输入张量之间的运算规则。其中，'bkd' 表示第一个输入张量slots的形状为 (b,k,d)batch/k聚类中心数/d特征维度，'bdhw' 表示第二个输入张量的形状为 (b, d, h, w)
-        这意味着函数将两个张量进行了乘法运算，并沿着 k 维度和 d*h*w 维度进行求和，得到了一个形状为 (b, k, h, w) 的输出张量：。
-        '''
-        '''
-        得到聚类中心响应dots:map-----dots bkhw    
+        具体来说，该函数的第一个参数是一个字符串，指定了输入张量之间的运算规则。其中，'bkd' 表示第一个输入张量slots的形状为 (b,k,d)batch/k聚类中心数/d特征维度，
+        这意味着函数将两个张量进行了乘法运算，并沿着 d维度进行求和，得到了一个形状为 (b, k, h, w) 的输出张量：聚类中心响应dots:map-----dots bkhw。
         '''
         attn = (dots / self.temp).softmax(dim=1) + self.eps#Aθl(attn)=softmax(  dots / self.temp )/温度系数并在dim=1下归一化sum=1#softmax分布结果(dino的部分)
         slots = torch.einsum('bdhw,bkhw->bkd', x_prev, attn / attn.sum(dim=(2, 3), keepdim=True))#Sθ(slot)=平均化(x点乘attn)
@@ -128,9 +125,22 @@ class SlotCon(nn.Module):
         self.dim_out = args.dim_out
         self.teacher_momentum = args.teacher_momentum
 
-        self.num_channels = 512 if args.arch in ('resnet18', 'resnet34') else 2048#resnet50输出通道数是2048
-        self.encoder_q = encoder(head_type='early_return')
-        self.encoder_k = encoder(head_type='early_return')
+        if args.arch in ('resnet18', 'resnet34'):
+            self.num_channels = 512
+        elif args.arch in ('vit_tiny'):
+            self.num_channels = 192
+        elif args.arch in ('vit_small'):
+            self.num_channels = 384
+        elif args.arch in ('vit_base'):
+            self.num_channels = 768
+        else:
+            self.num_channels = 2048
+
+        # self.num_channels = 512 if args.arch in ('resnet18', 'resnet34') else 2048#resnet50输出通道数是2048
+        
+        if encoder is None:
+            self.encoder_q = encoder(head_type='early_return')
+            self.encoder_k = encoder(head_type='early_return')
 
         for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
             param_k.data.copy_(param_q.data)  # initialize
@@ -256,7 +266,7 @@ class SlotCon(nn.Module):
         q,k是slots，score是dots
         对比学习的损失函数:InfoNCE
         '''
-        q = q.flatten(0, 1)  #q:bkd---b*k  d   q先predictor后再做归一化
+        q = q.flatten(0, 1)  #q:bkd---b*k  d   q待会得输入predictor，对其输出做归一化
         k = F.normalize(k.flatten(0, 1), dim=1)#k先展平至b*k  d后归一化
         '''
         由于初始的slot由整个数据集共享，因此在一个特定的视图view中可能缺少相应的语义，从而产生冗余的slot。
@@ -264,19 +274,20 @@ class SlotCon(nn.Module):
         '''
         '''#scatter_(dim,index,src)，在维度dim上，将索引号为index最大分数的位置，替换为src:1    
         dots:bkhw
-        scatter_(1, score_q.argmax(1, keepdim=True), 1)得到n个样本的k张h*w大小的slot_i（语义类别i）(i=0~k-1)的响应图
+        b个khw，scatter_(1, score_q.argmax(1, keepdim=True), 1)n个样本的k张h*w大小的slot_i（语义类别i）(i=0~k-1)的响应图
         sum sum>0   mask无法占据主导像素的插槽(k类的响应小于0的mask掉)  ---b k，且全部都>0/=0(mask)   ---mask_q:b k    a1...ak  b1...bk
         '''
         mask_q = (torch.zeros_like(score_q).scatter_(1, score_q.argmax(1, keepdim=True), 1).sum(-1).sum(-1) > 0).long().detach()
-        mask_k = (torch.zeros_like(score_k).scatter_(1, score_k.argmax(1, keepdim=True), 1).sum(-1).sum(-1) > 0).long().detach()#K个概率取最大概率---对应一类，生成与类别绑定的masks。
+        mask_k = (torch.zeros_like(score_k).scatter_(1, score_k.argmax(1, keepdim=True), 1).sum(-1).sum(-1) > 0).long().detach()#b k    a1...ak  b1...bk
         mask_intersection = (mask_q * mask_k).view(-1)#展平，b k---b*k               a1...akb1...bk
-        #单步调试 GDB FPGD
-        idxs_q = mask_intersection.nonzero().squeeze(-1)#含语义的slot索引---单一维度的idxs_q
+        
+        idxs_q = mask_intersection.nonzero().squeeze(-1)#含语义的slot索引---idxs_q
 
-        mask_k = concat_all_gather(mask_k.view(-1))#展平，b k---b*k               a1...akb1...bk
+        mask_k = concat_all_gather(mask_k.view(-1))#展平，b k---b*k   b*k--gather---n b*k      n  b*k  mask_k:n条  a1...akb1...bk
         idxs_k = mask_k.nonzero().squeeze(-1)#除去没有物体的，得到含有物体的idxs
-
-        N = k.shape[0] #k: b*k*d           #q[idxs_q]：b*k  d_in ---predictor---b*k  d_out   (d_in=d_out=agr.dim-out = 256)
+        '''qk相似度矩阵，q是正样本，k是包含正样本与负样本，label：'''
+        N = k.shape[0] #k: b*k  d    N=b*k       
+        #q：b*k  d_in ---经过predictor_slot---b*k  d_out   (d_in=d_out=agr.dim-out = 256)
         # b*k  d_out,b*k_gather  d_out-> b*k  b*k_gather(两view的交互响应矩阵)
         logits = torch.einsum('nc,mc->nm', [F.normalize(self.predictor_slot(q[idxs_q]), dim=1), concat_all_gather(k)[idxs_k]]) / tau
         labels = mask_k.cumsum(0)[idxs_q + N * torch.distributed.get_rank()] - 1#标签的取值范围应该在[0，类别数-1]之间
@@ -287,7 +298,7 @@ class SlotCon(nn.Module):
         具体来说，通过mask_k.cumsum(0)计算得到Key的类别累计和，再根据idxs_q和进程编号获得对应的类别编号，从而得到labels
         '''
         return F.cross_entropy(logits, labels) * (2 * tau)#labels怎么得到的，因为是自监督，将k的输出作为label
-
+#单步调试 GDB FPGD
     def forward(self, input):
         crops, coords, flags = input
         x1, x2 = self.projector_q(self.encoder_q(crops[0])), self.projector_q(self.encoder_q(crops[1]))#v->f(v)->p(v)
@@ -304,7 +315,7 @@ class SlotCon(nn.Module):
         loss = self.group_loss_weight * self.self_distill(q1_aligned.permute(0, 2, 3, 1).flatten(0, 2), k2_aligned.permute(0, 2, 3, 1).flatten(0, 2)) \
              + self.group_loss_weight * self.self_distill(q2_aligned.permute(0, 2, 3, 1).flatten(0, 2), k1_aligned.permute(0, 2, 3, 1).flatten(0, 2))#\换行
 
-        self.update_center(torch.cat([score_k1, score_k2]).permute(0, 2, 3, 1).flatten(0, 2))#bkhw  bhwk---flatten(s=0,end=2)保留b与h维度  b*h*w  k
+        self.update_center(torch.cat([score_k1, score_k2]).permute(0, 2, 3, 1).flatten(0, 2))#bkhw  bhwk---flatten(s=0,end=2)  b*h*w  k
         '''
         loss=group_loss_weight*自蒸馏的损失(两个dots对齐后的损失)+(1-group_loss_weight)*slots：q1,q2对比学习的infoNCE损失
         '''
@@ -346,7 +357,18 @@ class SlotConEval(nn.Module):
         self.dim_hidden = args.dim_hidden
         self.dim_out = args.dim_out
 
-        self.num_channels = 512 if args.arch in ('resnet18', 'resnet34') else 2048
+        # self.num_channels = 512 if args.arch in ('resnet18', 'resnet34') else 2048
+        if args.arch in ('resnet18', 'resnet34'):
+            self.num_channels = 512
+        elif args.arch in ('vit_tiny'):
+            self.num_channels = 192
+        elif args.arch in ('vit_small'):
+            self.num_channels = 384
+        elif args.arch in ('vit_base'):
+            self.num_channels = 768
+        else:
+            self.num_channels = 2048
+            
         self.encoder_k = encoder(head_type='early_return')
         for param_k in self.encoder_k.parameters():
             param_k.requires_grad = False  # not update by gradient
@@ -508,6 +530,9 @@ class DINOLoss(nn.Module):
 
 
 '''SlotAttention'''
+''' 通过将input作为k-v对，slots作为q，将slots参数初始化为高斯分布，随后对kqv分别做projection，
+将kq做dots再softamx得到attn（注意力分数），将attn与v做dots得到注意力机制的最终输出update，将该输出与slot_pre输入GRU，进行GRU的更新
+gru(updates, [slots_prev])，将GRU输出的slots做LN归一化后得到slot attention一次迭代更新得到的slots，循环n次(相对于n层transformer)'''
 '''
 # class SlotAttention(layers.Layer):
 #   """Slot Attention module.带GRU的transformer
@@ -589,6 +614,5 @@ class DINOLoss(nn.Module):
 #       # Slot update.
 #       slots, _ = self.gru(updates, [slots_prev])#迭代更新slot
 #       slots += self.mlp(self.norm_mlp(slots))
-
 #     return slots
 '''

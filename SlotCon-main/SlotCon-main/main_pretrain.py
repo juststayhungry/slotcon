@@ -10,18 +10,25 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
+from torchvision import models as torchvision_models
 
 from data.datasets import ImageFolder
 from data.transforms import CustomDataAugmentation
 
 from models import resnet
+from models import vision_transformer as vits
 from models.slotcon import SlotCon
 from utils.lars import LARS
 from utils.logger import setup_logger
 from utils.lr_scheduler import get_scheduler
 from utils.util import AverageMeter
 
+torchvision_archs = sorted(name for name in torchvision_models.__dict__
+    if name.islower() and not name.startswith("__")
+    and callable(torchvision_models.__dict__[name]))
+print(vits.__dict__)
 model_names = sorted(name for name in resnet.__all__ if name.islower() and callable(resnet.__dict__[name]))
+model_names.append(torchvision_archs)
 
 def get_parser():
     parser = argparse.ArgumentParser('SlotCon')
@@ -42,7 +49,14 @@ def get_parser():
     parser.add_argument('--student-temp', default=0.1, type=float, help='student temperature')
     parser.add_argument('--center-momentum', default=0.9, type=float, help='momentum for the center')
     parser.add_argument('--group-loss-weight', default=0.5, type=float, help='balancing weight of the grouping loss')
-
+    # ViT Model parameters
+    parser.add_argument('--patch_size', default=16, type=int, help="""Size in pixels
+        of input square patches - default 16 (for 16x16 patches). Using smaller
+        values leads to better performance but requires more memory. Applies only
+        for ViTs (vit_tiny, vit_small and vit_base). If <16, we recommend disabling
+        mixed precision training (--use_fp16 false) to avoid unstabilities.""")
+    parser.add_argument('--drop_path_rate', type=float, default=0.1, help="stochastic depth rate")
+    
     # optim.
     parser.add_argument('--batch-size', type=int, default=512, help='total batch size')
     parser.add_argument('--base-lr', type=float, default=1.0,
@@ -65,13 +79,20 @@ def get_parser():
     parser.add_argument('--seed', type=int, help='Random seed.')
     parser.add_argument('--num-workers', type=int, default=8, help='num of workers per GPU to use')
 
+    os.environ["LOCAL_RANK"] = "0"
     args = parser.parse_args()
     if os.environ["LOCAL_RANK"] is not None:
         args.local_rank = int(os.environ["LOCAL_RANK"])
     return args 
 
 def build_model(args):
-    encoder = resnet.__dict__[args.arch]
+    if args.arch in vits.__dict__.keys():
+        encoder = vits.__dict__[args.arch](
+            patch_size=args.patch_size,
+            drop_path_rate=args.drop_path_rate,  # stochastic depth
+        )
+    elif args.arch in resnet.__dict__.keys():
+        encoder = resnet.__dict__[args.arch]
     model = SlotCon(encoder, args).cuda()
 
     if args.optimizer == 'sgd':
